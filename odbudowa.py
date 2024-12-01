@@ -1,142 +1,122 @@
 import argparse
-from Bio import PDB
+from Bio.PDB import PDBParser, Superimposer, PDBIO, Residue, Model, Chain
+from Bio.PDB.Structure import Structure
 import os
-import numpy as np
+from copy import deepcopy
+from typing import Dict, List
 
-def load_template(template_dir, residue_name):
-    pdb_parser = PDB.PDBParser(QUIET=True)
-    template_path = os.path.join(template_dir, f"{residue_name}.pdb")
-    if not os.path.exists(template_path):
-        raise FileNotFoundError(f"Template file for {residue_name} not found: {template_path}")
-    structure = pdb_parser.get_structure(residue_name, template_path)
-    return structure
+def duplicate_residue(original: Residue.Residue, new_id, new_segid):
+    cloned_residue = Residue.Residue(new_id, original.resname, new_segid)
+    for atom in original:
+        cloned_residue.add(deepcopy(atom))
+    return cloned_residue
 
-def iteratively_superimpose(fixed_atoms, template_atoms):
-    max_iterations = 5
-    rmsd_threshold = 0.5
+def classify_residue_type(res: Residue.Residue):
+    if res.get_resname() in ['A', 'G']:
+        return 'purine'
+    elif res.get_resname() in ['C', 'T', 'U']:
+        return 'pyrimidine'
+    return None
 
-    for iteration in range(max_iterations):
-        if len(fixed_atoms) != len(template_atoms):
-            raise ValueError("Mismatched atom counts between fixed and template atoms during iteration.")
+def parse_structure(file_path: str, structure_id: str = 'cg_model'):
+    pdb_parser = PDBParser(QUIET=True)
+    return pdb_parser.get_structure(structure_id, file_path)
 
-        fixed_coords = np.array([atom.get_coord() for atom in fixed_atoms])
-        template_coords = np.array([atom.get_coord() for atom in template_atoms])
+def read_templates(template_paths: Dict[str, List[str]]) -> Dict[str, List[Structure]]:
+    pdb_parser = PDBParser(QUIET=True)
+    loaded_templates = {}
+    for residue_type, files in template_paths.items():
+        loaded_templates[residue_type] = [pdb_parser.get_structure(f"template_{residue_type}_{idx}", file) for idx, file
+                                          in enumerate(files)]
+    return loaded_templates
 
-        sup = PDB.Superimposer()
-        sup.set_atoms(fixed_atoms, template_atoms)
-        sup.apply(template_atoms)
-
-        distances = np.linalg.norm(fixed_coords - np.array([atom.get_coord() for atom in template_atoms]), axis=1)
-        rmsd = np.sqrt(np.mean(distances**2))
-        print(f"Iteration {iteration + 1}: RMSD = {rmsd:.4f}")
-
-        if rmsd <= rmsd_threshold or len(fixed_atoms) <= 3:
-            break
-
-    return sup.rotran, rmsd
-
-def rebuild_structure(input_path, output_path, template_dir):
-    pdb_parser = PDB.PDBParser(QUIET=True)
-    io = PDB.PDBIO()
-
-    structure = pdb_parser.get_structure("cg_structure", input_path)
-    output_structure = PDB.Structure.Structure("rebuilt_structure")
-
-    processed_residues = 0
-    skipped_residues = 0
-    rmsd_values = []
-
+def fetch_initial_residue(structure: Structure):
     for model in structure:
-        output_model = PDB.Model.Model(model.id)
         for chain in model:
-            output_chain = PDB.Chain.Chain(chain.id)
-            existing_ids = set()
             for residue in chain:
-                print(f"Residue {residue.resname} at {residue.id} contains atoms: {[atom.get_name() for atom in residue.get_atoms()]}")
+                return residue
 
-                if residue.resname in ["A", "C", "G", "U"]:
-                    template_structure = load_template(template_dir, residue.resname)
-                    template_residue = next(template_structure.get_residues())
+def common_atom_names(res1: Residue.Residue, res2: Residue.Residue):
+    atoms1 = {atom.name for atom in res1}
+    atoms2 = {atom.name for atom in res2}
+    return atoms1 & atoms2
 
+def construct_element(res: Residue.Residue, template_data: Dict[str, List[Structure]], is_backbone: bool = False):
+    template_res = fetch_initial_residue(template_data['backbone'][0]) if is_backbone else fetch_initial_residue(
+        template_data[res.resname][0])
 
-                    if residue.resname in ["A", "G"]:  #purines
-                        coarse_atoms = ["N9", "C2", "C6"]
-                    elif residue.resname in ["C", "U"]:  #pyrimidines
-                        coarse_atoms = ["N1", "C2", "C4"]
-                    else:
-                        print(f"Skipping unsupported residue: {residue.resname}")
-                        skipped_residues += 1
-                        continue
+    new_res = duplicate_residue(template_res, res.id, res.segid)
+    shared_atoms = common_atom_names(res, new_res)
 
-                    coarse_atoms += ["P", "C4'", "O5'", "C3'", "O3'"]
+    fixed_atoms = [atom for atom in res if atom.name in shared_atoms]
+    movable_atoms = [atom for atom in new_res if atom.name in shared_atoms]
 
-                    fixed_atoms = []
-                    for atom in residue.get_atoms():
-                        if atom.get_name() in coarse_atoms:
-                            fixed_atoms.append(atom)
+    superimposer = Superimposer()
+    superimposer.set_atoms(fixed_atoms, movable_atoms)
+    superimposer.apply(new_res.get_atoms())
 
-                    template_atoms = []
-                    for atom in template_residue.get_atoms():
-                        if atom.get_name() in coarse_atoms:
-                            template_atoms.append(atom)
+    return new_res
 
-                    if len(fixed_atoms) != len(template_atoms):
-                        print(f"Warning: Residue {residue.resname} at {residue.id} has mismatched atom counts.")
-                        print(f"Fixed atoms ({len(fixed_atoms)}): {[atom.get_name() for atom in fixed_atoms]}")
-                        print(f"Template atoms ({len(template_atoms)}): {[atom.get_name() for atom in template_atoms]}")
-                        matched_atoms = min(len(fixed_atoms), len(template_atoms))
-                        fixed_atoms = fixed_atoms[:matched_atoms]
-                        template_atoms = template_atoms[:matched_atoms]
+def regenerate_residue(res: Residue.Residue, template_data: Dict[str, List[Structure]]):
+    base = construct_element(res, template_data)
+    backbone = construct_element(res, template_data, is_backbone=True)
 
-                    if len(fixed_atoms) < 3:
-                        print(f"Skipping residue {residue.resname} at {residue.id} due to insufficient atoms for alignment.")
-                        skipped_residues += 1
-                        continue
+    rebuilt_residue = duplicate_residue(base, res.id, res.segid)
+    existing_atoms = {atom.name for atom in rebuilt_residue}
 
-                    rotran, rmsd = iteratively_superimpose(fixed_atoms, template_atoms)
-                    rmsd_values.append(rmsd)
+    for atom in backbone.get_atoms():
+        if atom.name not in existing_atoms:
+            rebuilt_residue.add(atom)
 
-                    new_residue = PDB.Residue.Residue(residue.id, residue.resname, residue.segid)
-                    for atom in template_residue.get_atoms():
-                        new_atom = atom.copy()
-                        new_atom.transform(rotran[0], rotran[1])
-                        new_residue.add(new_atom)
+    return rebuilt_residue
 
-                    for atom in residue.get_atoms():
-                        if atom.get_name() not in coarse_atoms:
-                            new_residue.add(atom.copy())
+def regenerate_structure(input_structure: Structure, templates: Dict[str, List[Structure]],
+                         output_structure_id: str = 'rebuilt_model') -> Structure:
+    rebuilt_structure = Structure(output_structure_id)
 
-                    output_chain.add(new_residue)
-                    print(f"Residue {residue.resname} at {residue.id} successfully rebuilt with {len(new_residue)} atoms and RMSD {rmsd:.4f}.")
-                    processed_residues += 1
+    for model in input_structure:
+        rebuilt_model = Model.Model(model.id)
+        rebuilt_structure.add(rebuilt_model)
+
+        for chain in model:
+            rebuilt_chain = Chain.Chain(chain.id)
+            rebuilt_model.add(rebuilt_chain)
+
+            for res in chain:
+                if res.resname in templates:
+                    rebuilt_residue = regenerate_residue(res, templates)
+                    rebuilt_chain.add(rebuilt_residue)
                 else:
-                    print(f"Unsupported residue: {residue.resname}")
-                    skipped_residues += 1
+                    print(f"Residue {res.resname} not supported; copying without changes.")
+                    rebuilt_chain.add(duplicate_residue(res, res.id, res.segid))
 
-            output_model.add(output_chain)
-        output_structure.add(output_model)
-
-    io.set_structure(output_structure)
-    io.save(output_path)
-
-    if rmsd_values:
-        min_rmsd = min(rmsd_values)
-        max_rmsd = max(rmsd_values)
-        avg_rmsd = sum(rmsd_values) / len(rmsd_values)
-        print(f"RMSD statistics: Min = {min_rmsd:.4f}, Max = {max_rmsd:.4f}, Avg = {avg_rmsd:.4f}")
-    print("Rebuilding complete.")
-    print(f"Processed residues: {processed_residues}")
-    print(f"Skipped residues: {skipped_residues}")
+    return rebuilt_structure
 
 def main():
-    parser = argparse.ArgumentParser(description="Rebuild full-atom structure from coarse-grained model using templates.")
-    parser.add_argument("--input", required=True, help="Input coarse-grained PDB file.")
-    parser.add_argument("--output", required=True, help="Output rebuilt PDB file.")
-    parser.add_argument("--templates", required=True, help="Directory containing template PDB files.")
+    arg_parser = argparse.ArgumentParser(
+        description="Reconstruct full-atom structure from a coarse-grained model using provided templates.")
+    arg_parser.add_argument("--input", required=True, help="Path to the input coarse-grained PDB file.")
+    arg_parser.add_argument("--output", required=True, help="Path for saving the reconstructed PDB file.")
+    arg_parser.add_argument("--templates", required=True, help="Directory containing PDB template files.")
 
-    args = parser.parse_args()
+    args = arg_parser.parse_args()
 
-    rebuild_structure(args.input, args.output, args.templates)
+    template_files = {
+        'A': [os.path.join(args.templates, 'A.pdb')],
+        'C': [os.path.join(args.templates, 'C.pdb')],
+        'G': [os.path.join(args.templates, 'G.pdb')],
+        'U': [os.path.join(args.templates, 'U.pdb')],
+        'backbone': [os.path.join(args.templates, 'backbone.pdb')]
+    }
+
+    templates = read_templates(template_files)
+    coarse_grained_structure = parse_structure(args.input)
+    rebuilt_structure = regenerate_structure(coarse_grained_structure, templates, args.output)
+
+    io = PDBIO()
+    io.set_structure(rebuilt_structure)
+    io.save(args.output)
+
 
 if __name__ == "__main__":
     main()
